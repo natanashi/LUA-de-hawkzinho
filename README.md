@@ -38,9 +38,12 @@ Tudo é desenhado por um único fragment shader, sem texturas nem modelos.
 
 O giro do céu e da lua é guardado em quatérnions, para acumular arrasto em
 qualquer direção sem deriva. A lua recebe um ângulo maior que o céu para o mesmo
-arrasto (÷ `MOON_TAN`): ela é uma esfera de raio 1 a 7 unidades de distância, e
-esse é o fator exato que faz a superfície acompanhar o cursor 1:1, como girar um
-globo com a mão.
+arrasto: ela é uma esfera de raio 1 a 7 unidades de distância, então o mesmo
+ângulo varre bem menos pixels na tela. O fator `1/MOON_TAN` faria a superfície
+acompanhar o cursor exatamente, como girar um globo com a mão — mas o arrasto
+costuma acontecer longe do disco, no céu aberto, e ali essa taxa fica nervosa.
+`MOON_DRAG` segura a rédea: com 0.33, as estrelas seguem o cursor 1:1 e a
+superfície anda um terço disso.
 
 Todo movimento tem a velocidade dividida pelo zoom, para o cenário andar igual
 perto ou longe.

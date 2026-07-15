@@ -484,14 +484,19 @@ void main() {
   // The moon needs a bigger angle than the sky for the same drag: it is a
   // sphere of radius 1 sitting 7 units away, so turning it by an angle sweeps
   // its surface across far fewer pixels than turning the sky by that same
-  // angle. Dividing by MOON_TAN is exactly the factor that makes the surface
-  // track the cursor 1:1 at the centre of the disc, like spinning a globe --
-  // and it holds at any zoom, because k already carries the zoom.
+  // angle. 1/MOON_TAN is the factor that would make the surface track the
+  // cursor exactly, like spinning a globe under your hand -- but the drag
+  // usually happens out in open sky, far from the disc, where that rate feels
+  // twitchy. MOON_DRAG dials it back: the moon reads as distant and heavy
+  // while staying reachable. Holds at any zoom, because k already carries it.
+  var MOON_DRAG = 0.33;
+
   function rotateView(ax, ay) {
     if (ax === 0 && ay === 0) return;
     var r = qMul(qAxis(0, 1, 0, ay), qAxis(1, 0, 0, ax));
     skyQ = qNorm(qMul(skyQ, [-r[0], -r[1], -r[2], r[3]]));
-    var m = qMul(qAxis(0, 1, 0, ay / MOON_TAN), qAxis(1, 0, 0, ax / MOON_TAN));
+    var f = MOON_DRAG / MOON_TAN;
+    var m = qMul(qAxis(0, 1, 0, ay * f), qAxis(1, 0, 0, ax * f));
     moonQ = qNorm(qMul(moonQ, [-m[0], -m[1], -m[2], m[3]]));
   }
   var scale = Math.min(window.devicePixelRatio || 1, 1.25);
