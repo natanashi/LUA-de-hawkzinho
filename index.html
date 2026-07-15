@@ -1,0 +1,671 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Lua</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: #000;
+    overflow: hidden;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+    touch-action: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<script id="vs" type="x-shader/x-vertex">
+attribute vec2 aPos;
+void main() { gl_Position = vec4(aPos, 0.0, 1.0); }
+</script>
+
+<script id="fs" type="x-shader/x-fragment">
+#extension GL_OES_standard_derivatives : enable
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+
+uniform vec2  uRes;
+uniform float uTime;
+uniform float uTanHalf;   // tan(fov/2)
+uniform float uPixAng;    // radians per pixel
+uniform vec2  uPan;
+uniform mat3  uMoonM;     // moon orientation (auto-spin + drag)
+uniform mat3  uSkyM;      // sky orientation (drift + drag)
+uniform float uLightPhase;
+
+const vec3  MOON_C = vec3(0.0, 0.0, -7.0);
+const float MOON_R = 1.0;
+
+// ---------- hashes (Dave Hoskins, sin-free) ----------
+float hash13(vec3 p) {
+  p = fract(p * 0.1031);
+  p += dot(p, p.zyx + 31.32);
+  return fract((p.x + p.y) * p.z);
+}
+vec3 hash33(vec3 p) {
+  p = fract(p * vec3(0.1031, 0.1030, 0.0973));
+  p += dot(p, p.yxz + 33.33);
+  return fract((p.xxy + p.yxx) * p.zyx);
+}
+vec3 hash32(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
+  p3 += dot(p3, p3.yxz + 33.33);
+  return fract((p3.xxy + p3.yzz) * p3.zyx);
+}
+
+// ---------- value noise / fbm ----------
+float vnoise(vec3 x) {
+  vec3 i = floor(x);
+  vec3 w = fract(x);
+  w = w * w * (3.0 - 2.0 * w);
+  float a = hash13(i + vec3(0.0, 0.0, 0.0));
+  float b = hash13(i + vec3(1.0, 0.0, 0.0));
+  float c = hash13(i + vec3(0.0, 1.0, 0.0));
+  float d = hash13(i + vec3(1.0, 1.0, 0.0));
+  float e = hash13(i + vec3(0.0, 0.0, 1.0));
+  float f = hash13(i + vec3(1.0, 0.0, 1.0));
+  float g = hash13(i + vec3(0.0, 1.0, 1.0));
+  float h = hash13(i + vec3(1.0, 1.0, 1.0));
+  return mix(mix(mix(a, b, w.x), mix(c, d, w.x), w.y),
+             mix(mix(e, f, w.x), mix(g, h, w.x), w.y), w.z);
+}
+float fbm(vec3 p, int oct) {
+  float s = 0.0, a = 0.5, n = 0.0;
+  for (int i = 0; i < 6; i++) {
+    if (i >= oct) break;
+    s += a * vnoise(p);
+    n += a;
+    p *= 2.03;
+    a *= 0.5;
+  }
+  return s / n;
+}
+
+mat3 axisRot(vec3 a, float ang) {
+  float c = cos(ang), s = sin(ang), t = 1.0 - c;
+  return mat3(
+    t * a.x * a.x + c,       t * a.x * a.y + s * a.z, t * a.x * a.z - s * a.y,
+    t * a.x * a.y - s * a.z, t * a.y * a.y + c,       t * a.y * a.z + s * a.x,
+    t * a.x * a.z + s * a.y, t * a.y * a.z - s * a.x, t * a.z * a.z + c
+  );
+}
+
+// ---------- craters: 3D cellular impact field ----------
+float craterLayer(vec3 p, float scale, float seed) {
+  vec3 q = p * scale;
+  vec3 ip = floor(q);
+  vec3 fp = q - ip;
+  float h = 0.0;
+  for (int x = -1; x <= 1; x++) {
+    for (int y = -1; y <= 1; y++) {
+      for (int z = -1; z <= 1; z++) {
+        vec3 g = vec3(float(x), float(y), float(z));
+        vec3 o = hash33(ip + g + seed);
+        if (o.z > 0.32) continue;
+        vec3 cc = g + 0.15 + o * 0.7;
+        float d = length(fp - cc);
+        float r = 0.26 + 0.34 * o.x;
+        if (d >= r) continue;
+        // Flat floor, steep wall, sharp rim. Both terms must reach zero in
+        // value AND slope at t = 1, or the step at the crater edge shows up
+        // as a hard ring in the normals.
+        float t = d / r;
+        float depth = -1.0 + smoothstep(0.42, 0.86, t);
+        float u = clamp((t - 0.86) / 0.14, -1.0, 1.0);
+        float rim = 0.5 + 0.5 * cos(3.14159265 * u);
+        float fresh = fract(o.z * 41.7); // old craters have worn their rims away
+        h += (depth * 0.95 + rim * 0.36 * fresh) * (0.40 + 0.60 * o.y);
+      }
+    }
+  }
+  return h;
+}
+
+// Level of detail driven by the on-screen footprint: octaves appear as you zoom.
+// The maria are young lava plains, so they swallow the big old craters and keep
+// only the fine peppering — that contrast is what stops the surface reading as
+// a uniform field of bubbles.
+float heightAt(vec3 p, float maxScale, float maria) {
+  float h = 0.55 * (fbm(p * 1.3, 4) - 0.5) * mix(1.0, 0.35, maria);
+  float sc = 2.4, am = 1.0;
+  for (int i = 0; i < 8; i++) {
+    if (sc > maxScale) break;
+    float att = mix(1.0, clamp(0.10 + float(i) * 0.13, 0.0, 1.0), maria);
+    h += am * att * craterLayer(p, sc, float(i) * 37.0 + 5.0);
+    sc *= 2.1;
+    am *= 0.5;
+  }
+  // Past the last affordable crater octave, cheap fractal grain carries the
+  // relief so deep zoom keeps texture instead of going smooth.
+  if (maxScale > sc) h += am * 1.6 * (fbm(p * sc * 0.5, 3) - 0.5);
+  return h;
+}
+
+vec3 surfaceAlbedo(vec3 p, float h, float maria) {
+  vec3 a = mix(vec3(0.86, 0.845, 0.815), vec3(0.25, 0.265, 0.315), maria);
+  a *= 0.80 + 0.38 * fbm(p * 7.0, 3);
+  a = mix(a, a * 1.35, smoothstep(0.06, 0.42, h));
+  return a;
+}
+
+// Mikkelsen surface-gradient bump mapping (one height sample per pixel)
+vec3 perturbNormal(vec3 pos, vec3 N, float h, float amount) {
+  vec3 dpdx = dFdx(pos);
+  vec3 dpdy = dFdy(pos);
+  float dhdx = dFdx(h);
+  float dhdy = dFdy(h);
+  vec3 r1 = cross(dpdy, N);
+  vec3 r2 = cross(N, dpdx);
+  float det = dot(dpdx, r1);
+  vec3 grad = sign(det) * (dhdx * r1 + dhdy * r2);
+  return normalize(abs(det) * N - amount * grad);
+}
+
+// ---------- stars ----------
+// The sky is sampled on a cube-face grid (9 cells/layer) rather than a 3D shell
+// grid (27 cells/layer) — same look, a third of the cost on every screen pixel.
+vec2 cubeFace(vec3 d, out float face, out float axisScale) {
+  vec3 a = abs(d);
+  vec2 uv;
+  if (a.x >= a.y && a.x >= a.z)      { face = d.x > 0.0 ? 0.0 : 1.0; uv = d.yz / a.x; }
+  else if (a.y >= a.z)               { face = d.y > 0.0 ? 2.0 : 3.0; uv = d.xz / a.y; }
+  else                               { face = d.z > 0.0 ? 4.0 : 5.0; uv = d.xy / a.z; }
+  axisScale = 1.0 + dot(uv, uv); // face uv stretches away from the face centre
+  return uv;
+}
+
+vec3 starLayer(vec2 uv, float face, float scale, float cpp, float prob, float seed) {
+  vec2 q = uv * scale;
+  vec2 ip = floor(q);
+  vec2 fp = q - ip;
+  vec3 acc = vec3(0.0);
+  for (int x = -1; x <= 1; x++) {
+    for (int y = -1; y <= 1; y++) {
+      vec2 g = vec2(float(x), float(y));
+      vec3 o = hash32(ip + g + vec2(seed + face * 91.7, seed * 1.7 + face * 13.1));
+      if (o.z > prob) continue;
+      vec2 cc = g + 0.1 + o.xy * 0.8;
+      float d = length(fp - cc);
+      // radius fixed in pixels, so stars stay points at any magnification
+      float rnd = fract(o.z * 71.3);
+      float r = (0.60 + 0.80 * rnd) * cpp;
+      if (d > r * 3.0) continue;
+      float mag = 0.06 + 0.94 * pow(fract(o.z * 313.7), 3.0);
+      float core = smoothstep(r, 0.0, d);
+      float halo = 0.08 * exp(-d / (r * 1.1));
+      float tw = 0.76 + 0.24 * sin(uTime * (0.6 + 2.0 * rnd) + o.z * 250.0);
+      vec3 tint = mix(vec3(0.88, 0.93, 1.0), vec3(1.0, 0.97, 0.92), fract(o.z * 7.3));
+      acc += tint * (core + halo) * mag * tw;
+    }
+  }
+  return acc;
+}
+
+// Fainter layers fade in as the pixel footprint shrinks, so star density on
+// screen stays roughly constant while zooming — and the cost stays bounded.
+vec3 starField(vec3 rd, float pixAng) {
+  float face, axisScale;
+  vec2 uv = cubeFace(rd, face, axisScale);
+  vec3 col = vec3(0.0);
+  float sc = 22.0, amp = 1.0, prob = 0.30;
+  for (int i = 0; i < 5; i++) {
+    float cpp = pixAng * axisScale * sc; // cells per pixel
+    float w = smoothstep(0.34, 0.14, cpp);
+    if (w > 0.004) col += amp * w * starLayer(uv, face, sc, cpp, prob, float(i) * 57.0);
+    sc *= 2.6;
+    amp *= 0.5;
+    prob *= 0.45;
+  }
+  return col;
+}
+
+// ---------- meteors ----------
+// Drawn in screen space: they cross the view at any zoom, cost a handful of
+// dot products, and need no hash loop. Time is cut into slots; most slots fire
+// a streak, each with its own path, length and lifetime.
+vec3 meteor(vec2 uv, float aspect, float pixUV, float period, float seed) {
+  float slot = floor(uTime / period);
+  // Keep every hash input away from zero — Hoskins hashes go degenerate there.
+  vec3 h1 = hash33(vec3(slot * 1.37 + seed, seed * 3.1 + 11.7, 7.7 + seed * 0.7));
+  vec3 h2 = hash33(vec3(slot * 2.11 + seed * 1.9 + 5.3, seed * 5.7 + 2.9, 3.3 + seed));
+  if (h1.z > 0.62) return vec3(0.0);
+
+  float life = 0.55 + 0.60 * h2.z;
+  float t0 = h1.x * max(period - life, 0.01);
+  float lt = uTime - slot * period - t0;
+  if (lt < 0.0 || lt > life) return vec3(0.0);
+  float u = lt / life;
+
+  vec2 p0 = vec2((h1.y - 0.5) * (aspect + 0.6), 0.24 + 0.48 * fract(h1.x * 23.1));
+  float ang = -0.75 - 1.65 * h2.x;              // always heading downward
+  vec2 dir = vec2(cos(ang), sin(ang));
+  vec2 head = p0 + dir * (0.75 + 0.75 * h2.y) * u;
+  float trail = 0.09 + 0.15 * fract(h2.z * 13.7);
+
+  vec2 q = uv - head;
+  float aRaw = dot(q, -dir);                    // >0 behind the head
+  float perp = length(q + dir * clamp(aRaw, 0.0, trail));
+
+  // Tight head, and a trail that fades out instead of stopping dead.
+  float s = max(aRaw, 0.0) / trail;             // 0 at the head, 1 at the tail
+  float taper = exp(-s * 2.6) * (1.0 - smoothstep(0.6, 1.0, s));
+  float w = pixUV * 1.6 * (0.45 + 0.55 * taper); // trail narrows toward the tail
+  float core = smoothstep(w, 0.0, perp) * taper;
+  float glow = exp(-perp / (pixUV * 2.5)) * 0.12 * taper;
+  float hd = exp(-length(q) / (pixUV * 1.2)) * 1.4;
+
+  float env = smoothstep(0.0, 0.10, u) * (1.0 - smoothstep(0.45, 1.0, u));
+  env *= 0.72 + 0.28 * sin(uTime * 52.0 + h1.z * 40.0); // meteors flicker
+
+  vec3 tint = mix(vec3(0.72, 0.88, 1.0), vec3(1.0, 0.88, 0.65), h2.y);
+  return ((core + glow) * tint + hd * vec3(1.0, 0.98, 0.94))
+         * env * (0.6 + 0.7 * fract(h1.y * 11.7));
+}
+
+vec3 aces(vec3 x) {
+  return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
+
+void main() {
+  vec2 uv = (gl_FragCoord.xy - 0.5 * uRes) / uRes.y;
+  vec3 rd = normalize(vec3(uv * 2.0 * uTanHalf + uPan, -1.0));
+  vec3 ro = vec3(0.0);
+
+  vec3 cdir = normalize(MOON_C);
+  float angR = asin(MOON_R / length(MOON_C));
+  float ang = acos(clamp(dot(rd, cdir), -1.0, 1.0));
+
+  // ---- background sky ----
+  vec3 srd = uSkyM * rd;
+
+  vec3 col = vec3(0.0030, 0.0038, 0.0072);
+  float neb = fbm(srd * 2.2 + vec3(3.1), 5);
+  col += vec3(0.028, 0.038, 0.070) * pow(smoothstep(0.42, 0.95, neb), 2.5) * 0.40;
+  col += starField(srd, uPixAng);
+
+  float aspect = uRes.x / uRes.y;
+  float pixUV = 1.0 / uRes.y;
+  col += meteor(uv, aspect, pixUV, 7.0, 0.0);
+  col += meteor(uv, aspect, pixUV, 11.0, 4.0);
+
+  vec3 L = axisRot(vec3(0.0, 1.0, 0.0), sin(uLightPhase) * 0.14)
+           * normalize(vec3(-0.55, 0.42, 0.72));
+
+  // ---- moon halo ----
+  float e = max(ang - angR, 0.0) / max(angR, 1e-4);
+  float halo = 0.13 * exp(-e * 22.0) + 0.020 * exp(-e * 6.5) + 0.004 * exp(-e * 2.2);
+  halo *= 1.0 + 0.07 * sin(uTime * 0.31);
+  // Only the lit limb throws a glow — a gibbous moon isn't backlit.
+  vec3 perp = normalize(rd - cdir * dot(rd, cdir) + vec3(1e-6));
+  vec3 lperp = normalize(L - cdir * dot(L, cdir) + vec3(1e-6));
+  halo *= mix(0.18, 1.0, smoothstep(-0.75, 0.45, dot(perp, lperp)));
+  col += vec3(0.62, 0.72, 0.96) * halo;
+
+  // ---- moon ----
+  vec3 oc = ro - MOON_C;
+  float b = dot(oc, rd);
+  float c = dot(oc, oc) - MOON_R * MOON_R;
+  float disc = b * b - c;
+
+  if (disc > -0.05) {
+    float t = -b - sqrt(max(disc, 0.0));
+    vec3 pos = ro + rd * t;
+    vec3 N = normalize(pos - MOON_C);
+
+    vec3 sp = uMoonM * N;
+
+    // Keep the finest relief a few pixels wide: finer than that and the
+    // derivative-based normals alias into speckle along the terminator.
+    float foot = max(length(dFdx(pos)), length(dFdy(pos)));
+    float maxScale = 0.24 / max(foot, 1e-5);
+
+    float maria = smoothstep(0.47, 0.63, fbm(sp * 2.1 + vec3(19.3, 4.1, 7.7), 4));
+    float h = heightAt(sp, maxScale, maria);
+    vec3 Nb = perturbNormal(pos, N, h, 0.030);
+
+    vec3 alb = surfaceAlbedo(sp, h, maria);
+    vec3 V = -rd;
+
+    float ndl = dot(Nb, L);
+    float ndv = max(dot(Nb, V), 0.0);
+    float lam = max(ndl, 0.0);
+    float ls = lam / max(lam + ndv, 0.001);
+    float shade = mix(lam, ls * 1.05, 0.7);
+    shade *= smoothstep(-0.10, 0.18, ndl);
+
+    vec3 moon = alb * shade * vec3(1.0, 0.985, 0.95) * 1.02;
+    moon += alb * vec3(0.013, 0.017, 0.032) * smoothstep(0.25, -0.6, ndl);
+
+    float cov = smoothstep(angR + uPixAng, angR - uPixAng, ang);
+    col = mix(col, moon, cov);
+  }
+
+  // ---- grade ----
+  float vig = smoothstep(1.35, 0.30, length(uv * 1.55));
+  col *= mix(0.72, 1.0, vig);
+  col = aces(col * 1.02);
+  col = pow(col, vec3(1.0 / 2.2));
+  col += (hash13(vec3(gl_FragCoord.xy, uTime)) - 0.5) / 255.0;
+
+  gl_FragColor = vec4(col, 1.0);
+}
+</script>
+
+<script>
+(function () {
+  'use strict';
+
+  var canvas = document.getElementById('c');
+  var gl = canvas.getContext('webgl', {
+    antialias: false, alpha: false, depth: false, stencil: false,
+    powerPreference: 'high-performance'
+  }) || canvas.getContext('experimental-webgl');
+  if (!gl) return;
+  gl.getExtension('OES_standard_derivatives');
+
+  function compile(type, src) {
+    var s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+      console.error(gl.getShaderInfoLog(s));
+      return null;
+    }
+    return s;
+  }
+
+  var prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl.VERTEX_SHADER, document.getElementById('vs').textContent));
+  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, document.getElementById('fs').textContent));
+  gl.bindAttribLocation(prog, 0, 'aPos');
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+    console.error(gl.getProgramInfoLog(prog));
+    return;
+  }
+  gl.useProgram(prog);
+
+  var buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+  var U = {};
+  ['uRes', 'uTime', 'uTanHalf', 'uPixAng', 'uPan', 'uMoonM', 'uSkyM', 'uLightPhase']
+    .forEach(function (n) { U[n] = gl.getUniformLocation(prog, n); });
+
+  // ---------- quaternions ----------
+  // The sky carries a full 3D orientation now, so it can be spun any which way
+  // by dragging. Accumulating a quaternion (rather than a matrix) keeps it from
+  // drifting out of shape over a long session.
+  function qMul(a, b) {
+    return [
+      a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+      a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+      a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+      a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2]
+    ];
+  }
+  function qAxis(x, y, z, ang) {
+    var s = Math.sin(ang * 0.5);
+    return [x * s, y * s, z * s, Math.cos(ang * 0.5)];
+  }
+  function qNorm(q) {
+    var l = Math.sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]) || 1;
+    return [q[0] / l, q[1] / l, q[2] / l, q[3] / l];
+  }
+  var _m9 = new Float32Array(9);
+  function qToMat3(q) {
+    var x = q[0], y = q[1], z = q[2], w = q[3];
+    _m9[0] = 1 - 2 * (y * y + z * z); _m9[1] = 2 * (x * y + z * w); _m9[2] = 2 * (x * z - y * w);
+    _m9[3] = 2 * (x * y - z * w); _m9[4] = 1 - 2 * (x * x + z * z); _m9[5] = 2 * (y * z + x * w);
+    _m9[6] = 2 * (x * z + y * w); _m9[7] = 2 * (y * z - x * w); _m9[8] = 1 - 2 * (x * x + y * y);
+    return _m9;
+  }
+
+  // ---------- state ----------
+  var FOV0 = 0.55;                 // vertical field of view at zoom 1 (radians)
+  var MOON_TAN = 0.14434;          // tan(angular radius) of the moon, at z = -7
+  var ZMIN = 0.6, ZMAX = 14.0;
+
+  var zoom = 1.0, zoomTarget = 1.0;
+  var panX = 0.0, panY = 0.0;
+  var curU = 0.0, curV = 0.0;      // cursor in uv space (y up)
+  var lightPhase = 0.0;
+
+  var moonQ = [0, 0, 0, 1];        // moon orientation
+  var skyQ = [0, 0, 0, 1];         // sky orientation
+  var pendX = 0, pendY = 0;        // drag rotation banked since the last frame
+  var spinVX = 0, spinVY = 0;      // rad/s, carries the throw after release
+  var hist = [];                   // recent drag samples, for the release velocity
+
+  // Velocity comes from the pointer's own history over the last ~110ms, not from
+  // whatever landed in the last rendered frame: at any frame rate a single
+  // still frame before release would otherwise wipe the throw out.
+  function releaseThrow() {
+    var t = performance.now(), ax = 0, ay = 0, t0 = -1;
+    for (var i = 0; i < hist.length; i++) {
+      if (t - hist[i].t <= 110) {
+        if (t0 < 0) t0 = hist[i].t;
+        ax += hist[i].ax;
+        ay += hist[i].ay;
+      }
+
+    }
+    hist.length = 0;
+    var span = (t - t0) / 1000;
+    if (t0 < 0 || span < 0.008) { spinVX = spinVY = 0; return; }
+    spinVX = ax / span;
+    spinVY = ay / span;
+    var sp = Math.sqrt(spinVX * spinVX + spinVY * spinVY);
+    if (sp > 3.0) { spinVX *= 3.0 / sp; spinVY *= 3.0 / sp; }
+  }
+
+  // Rotate sky and moon by view-space angles. Both should follow the cursor, so
+  // each mapping (view->sky, view->moon surface) gets the inverse of the
+  // apparent motion.
+  //
+  // The moon needs a bigger angle than the sky for the same drag: it is a
+  // sphere of radius 1 sitting 7 units away, so turning it by an angle sweeps
+  // its surface across far fewer pixels than turning the sky by that same
+  // angle. Dividing by MOON_TAN is exactly the factor that makes the surface
+  // track the cursor 1:1 at the centre of the disc, like spinning a globe --
+  // and it holds at any zoom, because k already carries the zoom.
+  function rotateView(ax, ay) {
+    if (ax === 0 && ay === 0) return;
+    var r = qMul(qAxis(0, 1, 0, ay), qAxis(1, 0, 0, ax));
+    skyQ = qNorm(qMul(skyQ, [-r[0], -r[1], -r[2], r[3]]));
+    var m = qMul(qAxis(0, 1, 0, ay / MOON_TAN), qAxis(1, 0, 0, ax / MOON_TAN));
+    moonQ = qNorm(qMul(moonQ, [-m[0], -m[1], -m[2], m[3]]));
+  }
+  var scale = Math.min(window.devicePixelRatio || 1, 1.25);
+  var W = 0, H = 0;
+
+  function tanHalf(z) { return Math.tan(0.5 * FOV0 / z); }
+
+  function clampPan() {
+    var maxPan = MOON_TAN * 1.05 * Math.max(0, 1 - 1 / zoom);
+    var d = Math.sqrt(panX * panX + panY * panY);
+    if (d > maxPan && d > 0) {
+      panX *= maxPan / d;
+      panY *= maxPan / d;
+    }
+  }
+
+  function resize() {
+    var w = Math.max(1, Math.round(canvas.clientWidth * scale));
+    var h = Math.max(1, Math.round(canvas.clientHeight * scale));
+    if (w === W && h === H) return;
+    W = canvas.width = w;
+    H = canvas.height = h;
+    gl.viewport(0, 0, W, H);
+  }
+  window.addEventListener('resize', resize);
+
+  // ---------- input ----------
+  function setCursor(x, y) {
+    var r = canvas.getBoundingClientRect();
+    curU = (x - r.left - r.width * 0.5) / r.height;
+    curV = -(y - r.top - r.height * 0.5) / r.height;
+  }
+
+  canvas.addEventListener('wheel', function (e) {
+    e.preventDefault();
+    setCursor(e.clientX, e.clientY);
+    var d = e.deltaMode === 1 ? e.deltaY * 16 : (e.deltaMode === 2 ? e.deltaY * 400 : e.deltaY);
+    zoomTarget *= Math.exp(-d * 0.0016);
+    zoomTarget = Math.min(ZMAX, Math.max(ZMIN, zoomTarget));
+  }, { passive: false });
+
+  var dragging = false, lastX = 0, lastY = 0, pinch = 0;
+  var pointers = {};
+
+  canvas.addEventListener('pointerdown', function (e) {
+    pointers[e.pointerId] = { x: e.clientX, y: e.clientY };
+    if (Object.keys(pointers).length === 1) {
+      dragging = true;
+      lastX = e.clientX;
+      lastY = e.clientY;
+      setCursor(e.clientX, e.clientY);
+      spinVX = 0; spinVY = 0; hist.length = 0;   // grabbing halts any coast
+      canvas.style.cursor = 'grabbing';
+    } else {
+      dragging = false;
+      pinch = pinchDist();
+    }
+    canvas.setPointerCapture(e.pointerId); // last: a capture failure must not kill the drag
+  });
+
+  canvas.addEventListener('pointermove', function (e) {
+    setCursor(e.clientX, e.clientY);
+    if (!pointers[e.pointerId]) return;
+    pointers[e.pointerId] = { x: e.clientX, y: e.clientY };
+    var n = Object.keys(pointers).length;
+
+    if (n === 1 && dragging) {
+      var r = canvas.getBoundingClientRect();
+      var k = 2 * tanHalf(zoom) / r.height;   // ~radians per pixel
+      var dx = e.clientX - lastX, dy = e.clientY - lastY;
+      pendY += -dx * k;
+      pendX += -dy * k;
+      hist.push({ t: performance.now(), ax: -dy * k, ay: -dx * k });
+      if (hist.length > 16) hist.shift();
+      lastX = e.clientX;
+      lastY = e.clientY;
+    } else if (n >= 2) {
+      var d = pinchDist();
+      if (pinch > 0 && d > 0) {
+        zoomTarget *= d / pinch;
+        zoomTarget = Math.min(ZMAX, Math.max(ZMIN, zoomTarget));
+      }
+      pinch = d;
+      var ids = Object.keys(pointers);
+      setCursor((pointers[ids[0]].x + pointers[ids[1]].x) * 0.5,
+                (pointers[ids[0]].y + pointers[ids[1]].y) * 0.5);
+    }
+  });
+
+  function endPointer(e) {
+    delete pointers[e.pointerId];
+    if (Object.keys(pointers).length < 2) pinch = 0;
+    if (Object.keys(pointers).length === 0) {
+      if (dragging) releaseThrow();
+      dragging = false;
+      canvas.style.cursor = '';
+    }
+  }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+
+  function pinchDist() {
+    var ids = Object.keys(pointers);
+    if (ids.length < 2) return 0;
+    var a = pointers[ids[0]], b = pointers[ids[1]];
+    return Math.hypot(a.x - b.x, a.y - b.y);
+  }
+
+  // ---------- loop ----------
+  var prev = performance.now();
+  var t0 = prev;
+  var acc = 0, frames = 0;
+
+  function frame(now) {
+    var dt = Math.min((now - prev) / 1000, 0.05);
+    prev = now;
+    resize();
+
+    // smooth zoom, anchored at the cursor
+    var T0 = tanHalf(zoom);
+    zoom += (zoomTarget - zoom) * (1 - Math.exp(-dt * 11));
+    var T1 = tanHalf(zoom);
+    if (T0 !== T1) {
+      panX += 2 * curU * (T0 - T1);
+      panY += 2 * curV * (T0 - T1);
+    }
+    clampPan();
+
+    // motion slows as you zoom in, so it reads the same at any magnification
+    lightPhase += dt * 0.05 / zoom;
+
+    // Always flush banked drag, so a release can't strand the last few degrees.
+    if (pendX !== 0 || pendY !== 0) {
+      rotateView(pendX, pendY);
+      pendX = pendY = 0;
+    }
+    if (!dragging && (spinVX !== 0 || spinVY !== 0)) {
+      rotateView(spinVX * dt, spinVY * dt);
+      var damp = Math.exp(-dt * 1.5);
+      spinVX *= damp;
+      spinVY *= damp;
+      if (Math.abs(spinVX) < 1e-4 && Math.abs(spinVY) < 1e-4) spinVX = spinVY = 0;
+    }
+    // slow ambient motion, always
+    moonQ = qNorm(qMul(moonQ, qAxis(0.1384, 0.9886, 0.0593, dt * 0.018 / zoom)));
+    skyQ = qNorm(qMul(skyQ, qAxis(0.234, 0.957, 0.163, dt * 0.004 / zoom)));
+
+    var th = tanHalf(zoom);
+    gl.uniform2f(U.uRes, W, H);
+    gl.uniform1f(U.uTime, (now - t0) / 1000);
+    gl.uniform1f(U.uTanHalf, th);
+    gl.uniform1f(U.uPixAng, (FOV0 / zoom) / H);
+    gl.uniform2f(U.uPan, panX, panY);
+    gl.uniformMatrix3fv(U.uMoonM, false, qToMat3(moonQ));
+    gl.uniformMatrix3fv(U.uSkyM, false, qToMat3(skyQ));
+    gl.uniform1f(U.uLightPhase, lightPhase);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    // Resolution only ever steps down, never back up: a monotonic ladder can't
+    // oscillate or stall the page the way a two-way one can.
+    acc += dt; frames++;
+    if (frames >= 24) {
+      var avg = acc / frames;
+      acc = 0; frames = 0;
+      if (avg > 0.026 && scale > 0.6) {
+        scale = Math.max(0.6, scale - 0.2);
+        W = H = 0;
+      }
+    }
+
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
