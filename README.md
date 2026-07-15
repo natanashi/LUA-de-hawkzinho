@@ -1,7 +1,8 @@
 # LUA de hawkzinho
 
-Uma lua em WebGL, num céu escuro cheio de estrelas. Arquivo único, sem
-dependências e sem servidor — é só abrir o `index.html` no navegador.
+Um pequeno sistema solar em WebGL: uma lua, um planeta azul de continentes
+vermelhos e um sol de verdade, num céu escuro cheio de estrelas. Arquivo único,
+sem dependências e sem servidor — é só abrir o `index.html` no navegador.
 
 ![captura](docs/preview.png)
 
@@ -14,6 +15,12 @@ dependências e sem servidor — é só abrir o `index.html` no navegador.
 | Pinça (toque) | Zoom |
 
 Não há botões nem texto na tela, por design.
+
+O sol começa fora da vista — é assim no céu de verdade: com a lua gibosa, o sol
+está a ~130° de distância; os dois nunca caberiam juntos num campo de visão
+estreito. Arraste o céu para encontrá-lo e veja a fase da lua mudar ao vivo
+conforme ele se move. Alinhe o sol atrás da lua e você ganha um eclipse total,
+com o anel da coroa ao redor do disco escuro.
 
 ## Como funciona
 
@@ -35,6 +42,25 @@ Tudo é desenhado por um único fragment shader, sem texturas nem modelos.
 - **As estrelas cadentes** são desenhadas em espaço de tela, com cabeça compacta
   e rastro que afina e some. Duas trilhas independentes dão cerca de uma a cada
   7 segundos.
+- **O sol** é um disco com escurecimento de limbo real (mais brilhante no centro,
+  como o Sol de verdade) e uma coroa aditiva. Toda a luz da cena sai dele: as
+  fases da lua e do planeta são pura geometria, não pintura.
+- **O planeta** tem oceanos azuis, continentes vermelhos com litoral definido,
+  calotas polares, nuvens que deslizam sobre o chão, reflexo do sol no mar
+  aberto e borda azul de atmosfera (Rayleigh).
+
+## A física (dados reais, tempo comprimido)
+
+- Raio do planeta = 3.667 raios lunares — a razão Terra/Lua da NASA (6371/1737 km).
+- Eixo do planeta inclinado 23.4°, como o da Terra.
+- A lua é travada por maré: gira sobre si na mesma taxa em que o céu roda,
+  então o planeta nunca sai da face que a encara — como a Lua real, que mostra
+  sempre o mesmo lado para a Terra.
+- Dia do planeta : mês lunar = 1 : 27.32, a razão real (24 h : 27.32 dias).
+- Tempo comprimido ~300× (1 s ≈ 5 min): o dia do planeta leva ~4.8 min na tela
+  e o mês lunar ~2.2 h. Nada gira rápido.
+- Distâncias comprimidas para a composição, como em qualquer planetário; o sol
+  aparece maior que os 0.53° reais para não virar um ponto ofuscante.
 
 O giro do céu e da lua é guardado em quatérnions, para acumular arrasto em
 qualquer direção sem deriva. A lua recebe um ângulo maior que o céu para o mesmo
